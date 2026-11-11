@@ -13,9 +13,11 @@ from pykt.utils import debug_print,set_seed
 from pykt.datasets import init_dataset4train
 import datetime
 
-os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 device = "cpu" if not torch.cuda.is_available() else "cuda"
 os.environ['CUBLAS_WORKSPACE_CONFIG']=':4096:2'
+
+SGD_AUC_MODELS = ("akt_minimax", "akt_interfairauc", "akt_noisyauc", "akt_minimaxfairauc")
+IRT_AUC_MODELS = SGD_AUC_MODELS + ("akt_gated",)
 
 OPERA_ENHANCE_PRO_MODELS = [
     "dkt_enhance_pro",
@@ -52,16 +54,28 @@ def main(params):
         import wandb
         wandb.init()
 
-    set_seed(params["seed"])
     model_name, dataset_name, fold, emb_type, save_dir = params["model_name"], params["dataset_name"], \
         params["fold"], params["emb_type"], params["save_dir"]
+    set_seed(params["seed"], cuda_launch_blocking=model_name != "akt_gated")
+    if model_name == "akt_gated":
+        checkpoint = params.get("init_checkpoint")
+        if not checkpoint or not os.path.isfile(checkpoint):
+            raise ValueError("akt_gated requires --init_checkpoint pointing to a trained AKT model file.")
+        source_config = os.path.join(os.path.dirname(checkpoint), "config.json")
+        if os.path.isfile(source_config):
+            with open(source_config) as fin:
+                source_params = json.load(fin)["params"]
+            if source_params["model_name"] != "akt" or any(
+                source_params[key] != params[key] for key in ("dataset_name", "fold", "emb_type")
+            ):
+                raise ValueError("Use an AKT checkpoint from the same dataset, fold and embedding type.")
         
     debug_print(text = "load config files.",fuc_name="main")
     
     with open("../configs/kt_config.json") as f:
         config = json.load(f)
         train_config = config["train_config"]
-        if model_name in ["dkvmn","deep_irt", "sakt", "saint","saint++", "akt", "akt_minimax", "akt_interfairauc", "akt_noisyauc", "akt_minimaxfairauc", "akt_dro", "robustkt", "folibikt", "atkt", "lpkt", "skvmn", "dimkt"] + OPERA_BATCH64_MODELS:
+        if model_name in ["dkvmn","deep_irt", "sakt", "saint","saint++", "akt", "akt_dro", "robustkt", "folibikt", "atkt", "lpkt", "skvmn", "dimkt"] + OPERA_BATCH64_MODELS or model_name in IRT_AUC_MODELS:
             train_config["batch_size"] = 64 ## because of OOM
         if model_name in ("akt_pgdro", "akt_beshift"):
             train_config["batch_size"] = 64
@@ -80,8 +94,9 @@ def main(params):
             train_config["batch_size"] = params['batch_size']
         if 'num_epochs' in params:
             train_config["num_epochs"] = params['num_epochs']
-        if model_name in ("akt_minimax", "akt_interfairauc", "akt_noisyauc", "akt_minimaxfairauc"):
+        if model_name in SGD_AUC_MODELS:
             train_config["optimizer"] = "sgd"
+        if model_name in IRT_AUC_MODELS:
             for key in ("minimax_prefix_length", "minimax_item_col", "init_checkpoint", "batch_size", "num_epochs"):
                 model_config.pop(key, None)
         if model_name == "akt_pgdro":
@@ -104,7 +119,7 @@ def main(params):
     print(dataset_name, model_name, data_config, fold, batch_size)
     
     debug_print(text="init_dataset",fuc_name="main")
-    if model_name in ("akt_minimax", "akt_interfairauc", "akt_noisyauc", "akt_minimaxfairauc"):
+    if model_name in IRT_AUC_MODELS:
         train_loader, valid_loader = init_dataset4train(
             dataset_name, model_name, data_config, fold, batch_size,
             minimax_config={
@@ -125,9 +140,9 @@ def main(params):
 
     params_str = "_".join(
         "-".join(map(str, v)) if k == "noisy_gamma" else str(v) for k, v in params.items()
-        if k != "other_config" and not (model_name in ("akt_minimax", "akt_interfairauc", "akt_noisyauc", "akt_minimaxfairauc") and k == "init_checkpoint")
+        if k != "other_config" and not (model_name in IRT_AUC_MODELS and k == "init_checkpoint")
     )
-    if model_name in ("akt_minimax", "akt_interfairauc", "akt_noisyauc", "akt_minimaxfairauc") and params.get("init_checkpoint"):
+    if model_name in IRT_AUC_MODELS and params.get("init_checkpoint"):
         source = os.path.abspath(params["init_checkpoint"]).encode("utf-8")
         params_str += f"_warm_{hashlib.sha256(source).hexdigest()[:10]}"
 
@@ -159,7 +174,11 @@ def main(params):
     print(f"model_name:{model_name}")
     model = init_model(model_name, model_config, data_config[dataset_name], emb_type, dataset_name)
     print(f"model is {model}")
-    if model_name in ("akt_minimax", "akt_interfairauc", "akt_noisyauc", "akt_minimaxfairauc"):
+    if model_name == "akt_gated":
+        state = torch.load(params["init_checkpoint"], map_location="cpu")
+        model.load_akt_checkpoint(state)
+        opt = Adam(model.parameters(), lr=learning_rate)
+    elif model_name in SGD_AUC_MODELS:
         if params.get("init_checkpoint"):
             state = torch.load(params["init_checkpoint"], map_location=device)
             state["log_pair_weights"] = model.log_pair_weights

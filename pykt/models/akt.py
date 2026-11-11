@@ -78,7 +78,10 @@ class AKT(nn.Module):
             qa_embed_data = self.qa_embed(target)+q_embed_data
         return q_embed_data, qa_embed_data
 
-    def forward(self, q_data, target, pid_data=None, qtest=False):
+    def score_logits(self, features):
+        return self.out(features).squeeze(-1)
+
+    def _forward_logits(self, q_data, target, pid_data, *, reuse_attention_geometry=False):
         emb_type = self.emb_type
         # Batch First
         if emb_type.startswith("qid"):
@@ -106,12 +109,17 @@ class AKT(nn.Module):
         # BS.seqlen,d_model
         # Pass to the decoder
         # output shape BS,seqlen,d_model or d_model//2
-        d_output = self.model(q_embed_data, qa_embed_data, pid_embed_data)
+        d_output = self.model(
+            q_embed_data, qa_embed_data, pid_embed_data,
+            reuse_attention_geometry=reuse_attention_geometry,
+        )
 
         concat_q = torch.cat([d_output, q_embed_data], dim=-1)
-        output = self.out(concat_q).squeeze(-1)
-        m = nn.Sigmoid()
-        preds = m(output)
+        return self.score_logits(concat_q), c_reg_loss, concat_q
+
+    def forward(self, q_data, target, pid_data=None, qtest=False):
+        logits, c_reg_loss, concat_q = self._forward_logits(q_data, target, pid_data)
+        preds = logits.sigmoid()
         if not qtest:
             return preds, c_reg_loss
         else:

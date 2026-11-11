@@ -13,6 +13,7 @@ from .atkt import ATKT
 from .dkt_forget import DKTForget
 from .akt import AKT
 from .akt_minimax import AKT_MINIMAX, AKT_MINIMAXFAIRAUC
+from .akt_gated import AKT_GATED
 from .akt_interfairauc import AKT_INTERFAIRAUC
 from .akt_noisyauc import AKT_NOISYAUC
 from .akt_pgdro import AKT_PGDRO
@@ -88,6 +89,8 @@ def init_model(model_name, model_config, data_config, emb_type, dataset_name=Non
         model = AKT_MINIMAXFAIRAUC(data_config["num_c"], data_config["num_q"], **model_config, emb_type=emb_type, emb_path=data_config["emb_path"]).to(device)
     elif model_name == "akt_minimax":
         model = AKT_MINIMAX(data_config["num_c"], data_config["num_q"], **model_config, emb_type=emb_type, emb_path=data_config["emb_path"]).to(device)
+    elif model_name == "akt_gated":
+        model = AKT_GATED(data_config["num_c"], data_config["num_q"], **model_config, emb_type=emb_type, emb_path=data_config["emb_path"]).to(device)
     elif model_name == "akt_dro":
         model = AKT_DRO(data_config["num_c"], data_config["num_q"], **model_config, emb_type=emb_type, emb_path=data_config["emb_path"]).to(device)
     elif model_name == "lefokt_akt":

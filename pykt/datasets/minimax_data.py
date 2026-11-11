@@ -15,15 +15,19 @@ GROUP_INDEX = {"low": 0, "mid": 1, "high": 2}
 class MinimaxSequences(Dataset):
     """Attach a fixed student group and mask away predictions inside its prefix."""
 
-    def __init__(self, dataset, path, folds, histories, group_ids, prefix_length):
+    def __init__(self, dataset, path, folds, histories, group_ids, prefix_length, *, question_starts=False):
         self.dataset = dataset
-        rows = pd.read_csv(path, dtype=str, usecols=["uid", "fold", "responses"])
+        columns = ["uid", "fold", "responses"]
+        if question_starts:
+            columns.append("is_repeat")
+        rows = pd.read_csv(path, dtype=str, usecols=columns)
         rows = rows.loc[rows["fold"].isin(folds)]
         if len(rows) != len(dataset):
             raise ValueError("AKT minimax sequence rows do not match the PyKT dataset cache.")
         responses = dataset.dori["rseqs"].cpu().numpy()
         self.labels = responses[:, 1:]
         self.mask = (dataset.dori["masks"] & dataset.dori["smasks"]).cpu().clone()
+        self.question_mask = self.mask.clone() if question_starts else None
         self.groups = torch.full((len(dataset),), -1, dtype=torch.long)
         offsets = {}
         for idx, row in enumerate(rows.itertuples(index=False)):
@@ -33,6 +37,14 @@ class MinimaxSequences(Dataset):
             answers = np.fromstring(row.responses, sep=",", dtype=int)
             if not np.array_equal(responses[idx], answers):
                 raise ValueError(f"AKT minimax found stale or misordered sequence data for student {uid}.")
+            if question_starts:
+                repeats = np.fromstring(row.is_repeat, sep=",", dtype=int)
+                if repeats.shape != answers.shape or not np.isin(repeats[answers != -1], [0, 1]).all():
+                    raise ValueError(f"Invalid is_repeat values for student {uid}.")
+                # Later concepts of a question can already see its response
+                # in a standard AKT training sequence.
+                self.question_mask[idx] &= torch.from_numpy(repeats[1:] == 0)
+                self.mask[idx] &= self.question_mask[idx]
             start = offsets.get(uid, 0)
             actual = answers[answers != -1]
             expected = [label for _, label, _ in histories[uid][start:start + len(actual)]]
@@ -54,6 +66,8 @@ class MinimaxSequences(Dataset):
         row = self.dataset[idx]
         row["minimax_mask"] = self.mask[idx]
         row["minimax_group"] = self.groups[idx]
+        if self.question_mask is not None:
+            row["question_mask"] = self.question_mask[idx]
         return row
 
     def batch(self, indices):
@@ -69,6 +83,8 @@ class MinimaxSequences(Dataset):
             "minimax_mask": self.mask.index_select(0, rows).to(data_device, non_blocking=True),
             "minimax_group": self.groups.index_select(0, rows).to(data_device, non_blocking=True),
         }
+        if self.question_mask is not None:
+            batch["question_mask"] = self.question_mask.index_select(0, rows).to(data_device, non_blocking=True)
         for key in ("cseqs", "qseqs", "rseqs"):
             values = data[key]
             if values.numel():
@@ -120,7 +136,8 @@ class MinimaxStratifiedTargets:
 
 
 def minimax_loaders(config, fold, train, valid, batch_size, prefix_length=15, item_col="concepts",
-                    *, full_validation=False, stratified_targets=False, batched_sequences=False):
+                    *, full_validation=False, stratified_targets=False, batched_sequences=False,
+                    question_starts=False):
     # Reuse the same 2PL/EAP calibration and score cuts as the AUC audit.
     from DecomposeAUC.run_posthoc_auc_irt_tertiles import (
         assign_groups, calibrate, histories, read_sequences, score,
@@ -147,8 +164,10 @@ def minimax_loaders(config, fold, train, valid, batch_size, prefix_length=15, it
     scored = pd.concat([score(fit_rows, index, logits, grid, prior, min_items=3), ref], ignore_index=True)
     assign_groups(scored, cuts)
     group_ids = dict(zip(scored["student_id"], scored["cluster"].map(GROUP_INDEX)))
-    train = MinimaxSequences(train, sequence_path, train_folds, students, group_ids, prefix_length)
-    valid = MinimaxSequences(valid, sequence_path, valid_folds, students, group_ids, prefix_length)
+    train = MinimaxSequences(train, sequence_path, train_folds, students, group_ids, prefix_length,
+                             question_starts=question_starts)
+    valid = MinimaxSequences(valid, sequence_path, valid_folds, students, group_ids, prefix_length,
+                             question_starts=question_starts)
     train_counts = train.group_label_counts()
     if (train_counts == 0).any() or (valid.group_label_counts() == 0).any():
         raise ValueError("AKT minimax needs positives and negatives in all three groups in both splits.")

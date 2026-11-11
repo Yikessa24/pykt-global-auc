@@ -63,6 +63,21 @@ python -m DecomposeAUC.run_question_window_auc `
 
 ## AKT 公平性方法
 
+### AKT 门控残差预测头
+
+`akt_gated` 共享原 AKT 编码器，在原 logit 上加两个门控加权的残差分数。残差输出初始化为零，可以从同一折的原 AKT checkpoint 开始微调。预测时也使用残差头，输入仍是题目和作答历史。
+
+在 `examples/` 中运行。默认使用 BD06 fold 0 的 AKT 超参，包括 Adam、学习率 `1e-4` 和 64 条序列一批。
+
+```bash
+python wandb_akt_gated_train.py --init_checkpoint saved_model/bridge2algebra2006_akt_qid_saved_model_3407_0_0.05_256_64_8_4_0.0001_0_1/qid_model.ckpt
+python wandb_predict.py --save_dir saved_model/本次训练目录 --use_wandb 0
+```
+
+训练保留 BCE，用每道题首个知识点的预测做九格排序代理。这样每道题最多贡献一个用于配对的分数，同一道题前面的知识点作答不会进入该分数的预测历史。训练按序列组批，每个 IRT 组的正负样本各最多抽 64 个。验证同样使用题目首个知识点的分数。以微调前的结果为参照，在整体代理 AUC 下降不超过 `--max_auc_drop` 且最大双向差距没有增大的候选中，优先选最低格 AUC 最高的 checkpoint。`--minimax_weight 0` 可用于带预测头的纯 BCE 对照，此时按整体验证代理 AUC 选 checkpoint。
+
+测试沿用题目级滑窗与 late mean 概率融合。用 `windowauclate_mean` 和 `qid_test_question_window_predictions.txt` 跑上面的 BD06 分解流程。门控结构参考 [FEAMOE](https://www.ijcai.org/proceedings/2023/55)，九格训练目标参考 [MinimaxFairAUC](https://arxiv.org/abs/2208.10451)。
+
 ### MinimaxFairAUC 与分组误差稳健 AUC
 
 - akt_minimaxfairauc 使用独立的 wandb_akt_minimaxfairauc_train.py 入口。按历史 IRT 的低、中、高分组和正负标签做分层目标抽样，沿用 AKT 的历史上下文和原始 logits。训练按论文 Algorithm 1 对模型做 SGD、对组对权重做指数更新，验证分块精确计算最差组对的排序损失。固定步长与每步更新对应论文的更新式。训练预算按目标作答数计算。已有的 akt_minimax 联合 BCE 版本仍可从原入口使用。参考 [论文](https://arxiv.org/abs/2208.10451) 和 [作者代码](https://github.com/zhenhuan-yang/MinimaxFairAUC/tree/bb6d8e0)。

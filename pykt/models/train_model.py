@@ -88,6 +88,8 @@ def cal_loss(model, ys, r, rshft, sm, preloss=[]):
 
 def model_forward(model, data, rel=None):
     model_name = model.model_name
+    if model_name == "akt_gated":
+        return model.training_loss(data)
     if model_name == "akt_interfairauc":
         scores, reg = model.sequence_scores(data)
         mask = data["smasks"].to(scores.device)
@@ -356,7 +358,8 @@ def train_model(model, train_loader, valid_loader, num_epochs, opt, ckpt_path, t
     max_auc, best_epoch = 0, -1
     train_step = 0
     minimax = model.model_name in ("akt_minimax", "akt_minimaxfairauc")
-    fast_minimax = model.model_name == "akt_minimax"
+    gated = model.model_name == "akt_gated"
+    defer_loss_transfer = model.model_name in ("akt_minimax", "akt_gated")
     noisy_auc = model.model_name == "akt_noisyauc"
     grouped_ranking = minimax or noisy_auc or model.model_name == "akt_interfairauc"
     if minimax:
@@ -366,6 +369,15 @@ def train_model(model, train_loader, valid_loader, num_epochs, opt, ckpt_path, t
     if grouped_ranking:
         model.best_minimax_loss = (float("inf"), float("inf")) if noisy_auc else float("inf")
 
+    if gated:
+        baseline_auc, validacc, baseline_worst, baseline_gap = model.validation_scores(valid_loader)
+        validauc, max_auc, best_epoch = baseline_auc, baseline_auc, 0
+        best_gated = (baseline_worst, -baseline_gap, baseline_auc)
+        testauc = testacc = window_testauc = window_testacc = -1
+        if save_model:
+            torch.save(model.state_dict(), os.path.join(ckpt_path, model.emb_type+"_model.ckpt"))
+        print(f"akt_gated initial validation (first concept per question): AUC={baseline_auc:.6f}, "
+              f"worst cell={baseline_worst:.6f}, max xAUC gap={baseline_gap:.6f}")
 
     rel = None
     if model.model_name == "rkt":
@@ -416,15 +428,26 @@ def train_model(model, train_loader, valid_loader, num_epochs, opt, ckpt_path, t
             if minimax:
                 model.update_pair_weights(pair_risks, opt.param_groups[0]["lr"])
                 
-            loss_mean.append(loss.detach() if fast_minimax else loss.detach().cpu().numpy())
+            loss_mean.append(loss.detach() if defer_loss_transfer else loss.detach().cpu().numpy())
             if model.model_name == "gkt" and train_step%10==0:
                 text = f"Total train step is {train_step}, the loss is {loss.item():.5}"
                 debug_print(text = text,fuc_name="train_model")
         if model.model_name=='lpkt':
             scheduler.step()#update each epoch
-        loss_mean = torch.stack(loss_mean).mean().item() if fast_minimax else np.mean(loss_mean)
+        loss_mean = torch.stack(loss_mean).mean().item() if defer_loss_transfer else np.mean(loss_mean)
         
-        if grouped_ranking:
+        if gated:
+            auc, acc, worst_cell, gap = model.validation_scores(valid_loader)
+            candidate = (worst_cell, -gap, auc)
+            if model.minimax_weight == 0:
+                improved = auc > max_auc
+            else:
+                improved = auc >= baseline_auc - model.max_auc_drop and gap <= baseline_gap and candidate > best_gated
+            if improved:
+                best_gated = candidate
+            print(f"akt_gated validation (first concept per question): AUC={auc:.6f}, "
+                  f"worst cell={worst_cell:.6f}, max xAUC gap={gap:.6f}")
+        elif grouped_ranking:
             auc, acc, worst_risk = _evaluate_minimax(model, valid_loader)
             improved = worst_risk < model.best_minimax_loss
             if improved:
@@ -437,7 +460,7 @@ def train_model(model, train_loader, valid_loader, num_epochs, opt, ckpt_path, t
         ### atkt 有diff， 以下代码导致的
         ### auc, acc = round(auc, 4), round(acc, 4)
 
-        if not grouped_ranking:
+        if not (grouped_ranking or gated):
             improved = auc > max_auc + 1e-3
             if best_epoch == -1 and model.model_name in ("akt_pgdro", "akt_beshift"):
                 improved = True
@@ -456,7 +479,7 @@ def train_model(model, train_loader, valid_loader, num_epochs, opt, ckpt_path, t
                     save_test_path = os.path.join(ckpt_path, model.emb_type+"_test_window_predictions.txt")
                     window_testauc, window_testacc = evaluate(model, test_window_loader, model.model_name, save_path=save_test_path)
             validauc, validacc = auc, acc
-        auc_label = "checkpoint auc" if grouped_ranking else "best auc"
+        auc_label = "checkpoint auc" if grouped_ranking or gated else "best auc"
         print(f"Epoch: {i}, validauc: {validauc:.4}, validacc: {validacc:.4}, best epoch: {best_epoch}, {auc_label}: {max_auc:.4}, train loss: {loss_mean}, emb_type: {model.emb_type}, model: {model.model_name}, save_dir: {ckpt_path}")
         print(f"            testauc: {round(testauc,4)}, testacc: {round(testacc,4)}, window_testauc: {round(window_testauc,4)}, window_testacc: {round(window_testacc,4)}")
 

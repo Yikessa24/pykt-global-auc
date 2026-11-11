@@ -222,13 +222,14 @@ def init_dataset4train(dataset_name, model_name, data_config, i, batch_size, dif
         from .beshift import beshift_loaders
         return beshift_loaders(data_config, i, curtrain, curvalid, batch_size,
                                **(fairness_config or {"seed": 3407}))
-    if model_name in ("akt_minimax", "akt_interfairauc", "akt_noisyauc", "akt_minimaxfairauc"):
+    if model_name in ("akt_minimax", "akt_interfairauc", "akt_noisyauc", "akt_minimaxfairauc", "akt_gated"):
         from .minimax_data import minimax_loaders
         return minimax_loaders(
             data_config, i, curtrain, curvalid, batch_size,
-            full_validation=model_name == "akt_interfairauc",
+            full_validation=model_name in ("akt_interfairauc", "akt_gated"),
             stratified_targets=model_name in ("akt_minimaxfairauc", "akt_noisyauc"),
-            batched_sequences=model_name == "akt_minimax",
+            batched_sequences=model_name in ("akt_minimax", "akt_gated"),
+            question_starts=model_name == "akt_gated",
             **(minimax_config or {}),
         )
     train_loader = DataLoader(curtrain, batch_size=batch_size)

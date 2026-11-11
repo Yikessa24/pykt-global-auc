@@ -5,7 +5,7 @@ import numpy as np
 from pykt.datasets.data_loader import KTDataset
 from pykt.datasets.dkt_forget_dataloader import DktForgetDataset
 
-def set_seed(seed):
+def set_seed(seed, *, cuda_launch_blocking=True):
     """Set the global random seed.
     
     Args:
@@ -27,7 +27,8 @@ def set_seed(seed):
     python_random.seed(seed)
     # cuda env
     import os
-    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+    if cuda_launch_blocking:
+        os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
 
 import datetime
