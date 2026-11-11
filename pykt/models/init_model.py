@@ -12,6 +12,11 @@ from .kqn import KQN
 from .atkt import ATKT
 from .dkt_forget import DKTForget
 from .akt import AKT
+from .akt_minimax import AKT_MINIMAX, AKT_MINIMAXFAIRAUC
+from .akt_interfairauc import AKT_INTERFAIRAUC
+from .akt_noisyauc import AKT_NOISYAUC
+from .akt_pgdro import AKT_PGDRO
+from .dro.akt_dro import AKT_DRO
 from .gkt import GKT
 from .gkt_utils import get_gkt_graph
 from .lpkt import LPKT
@@ -70,8 +75,21 @@ def init_model(model_name, model_config, data_config, emb_type, dataset_name=Non
         model = SAINT(data_config["num_q"], data_config["num_c"], **model_config, emb_type=emb_type, emb_path=data_config["emb_path"]).to(device)
     elif model_name == "dkt_forget":
         model = DKTForget(data_config["num_c"], data_config["num_rgap"], data_config["num_sgap"], data_config["num_pcount"], **model_config).to(device)
-    elif model_name == "akt":
+    elif model_name in ("akt", "akt_beshift"):
         model = AKT(data_config["num_c"], data_config["num_q"], **model_config, emb_type=emb_type, emb_path=data_config["emb_path"]).to(device)
+        model.model_name = model_name
+    elif model_name == "akt_pgdro":
+        model = AKT_PGDRO(data_config["num_c"], data_config["num_q"], **model_config, emb_type=emb_type, emb_path=data_config["emb_path"]).to(device)
+    elif model_name == "akt_noisyauc":
+        model = AKT_NOISYAUC(data_config["num_c"], data_config["num_q"], **model_config, emb_type=emb_type, emb_path=data_config["emb_path"]).to(device)
+    elif model_name == "akt_interfairauc":
+        model = AKT_INTERFAIRAUC(data_config["num_c"], data_config["num_q"], **model_config, emb_type=emb_type, emb_path=data_config["emb_path"]).to(device)
+    elif model_name == "akt_minimaxfairauc":
+        model = AKT_MINIMAXFAIRAUC(data_config["num_c"], data_config["num_q"], **model_config, emb_type=emb_type, emb_path=data_config["emb_path"]).to(device)
+    elif model_name == "akt_minimax":
+        model = AKT_MINIMAX(data_config["num_c"], data_config["num_q"], **model_config, emb_type=emb_type, emb_path=data_config["emb_path"]).to(device)
+    elif model_name == "akt_dro":
+        model = AKT_DRO(data_config["num_c"], data_config["num_q"], **model_config, emb_type=emb_type, emb_path=data_config["emb_path"]).to(device)
     elif model_name == "lefokt_akt":
         model = LEFOKT_AKT(data_config["num_c"], data_config["num_q"], **model_config, emb_type=emb_type, emb_path=data_config["emb_path"]).to(device)
     elif model_name == "extrakt":
@@ -189,6 +207,6 @@ def init_model(model_name, model_config, data_config, emb_type, dataset_name=Non
 
 def load_model(model_name, model_config, data_config, emb_type, ckpt_path, dataset_name=None):
     model = init_model(model_name, model_config, data_config, emb_type, dataset_name)
-    net = torch.load(os.path.join(ckpt_path, emb_type+"_model.ckpt"))
+    net = torch.load(os.path.join(ckpt_path, emb_type+"_model.ckpt"), map_location=device)
     model.load_state_dict(net)
     return model

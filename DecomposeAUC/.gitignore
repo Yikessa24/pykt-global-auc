@@ -1,0 +1,3 @@
+auc_figures/
+*_pykt_pred_long.csv
+metrics/*_auc_metrics.txt

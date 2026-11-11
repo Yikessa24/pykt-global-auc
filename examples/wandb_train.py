@@ -1,5 +1,6 @@
 import os
 import argparse
+import hashlib
 import json
 
 import torch
@@ -60,8 +61,10 @@ def main(params):
     with open("../configs/kt_config.json") as f:
         config = json.load(f)
         train_config = config["train_config"]
-        if model_name in ["dkvmn","deep_irt", "sakt", "saint","saint++", "akt", "robustkt", "folibikt", "atkt", "lpkt", "skvmn", "dimkt"] + OPERA_BATCH64_MODELS:
+        if model_name in ["dkvmn","deep_irt", "sakt", "saint","saint++", "akt", "akt_minimax", "akt_interfairauc", "akt_noisyauc", "akt_minimaxfairauc", "akt_dro", "robustkt", "folibikt", "atkt", "lpkt", "skvmn", "dimkt"] + OPERA_BATCH64_MODELS:
             train_config["batch_size"] = 64 ## because of OOM
+        if model_name in ("akt_pgdro", "akt_beshift"):
+            train_config["batch_size"] = 64
         if model_name in ["simplekt","stablekt", "datakt", "sparsekt", "mtkt"]:
             train_config["batch_size"] = 64 ## because of OOM
         if model_name in ["gkt"]:
@@ -77,6 +80,17 @@ def main(params):
             train_config["batch_size"] = params['batch_size']
         if 'num_epochs' in params:
             train_config["num_epochs"] = params['num_epochs']
+        if model_name in ("akt_minimax", "akt_interfairauc", "akt_noisyauc", "akt_minimaxfairauc"):
+            train_config["optimizer"] = "sgd"
+            for key in ("minimax_prefix_length", "minimax_item_col", "init_checkpoint", "batch_size", "num_epochs"):
+                model_config.pop(key, None)
+        if model_name == "akt_pgdro":
+            train_config["optimizer"] = "sgd"
+        beshift_config = {}
+        if model_name == "akt_beshift":
+            for key in params:
+                if key.startswith("beshift_"):
+                    beshift_config[key[len("beshift_"):]] = model_config.pop(key)
         # model_config = {"d_model": params["d_model"], "n_blocks": params["n_blocks"], "dropout": params["dropout"], "d_ff": params["d_ff"]}
     batch_size, num_epochs, optimizer = train_config["batch_size"], train_config["num_epochs"], train_config["optimizer"]
 
@@ -90,13 +104,32 @@ def main(params):
     print(dataset_name, model_name, data_config, fold, batch_size)
     
     debug_print(text="init_dataset",fuc_name="main")
-    if model_name not in ["dimkt"]:
+    if model_name in ("akt_minimax", "akt_interfairauc", "akt_noisyauc", "akt_minimaxfairauc"):
+        train_loader, valid_loader = init_dataset4train(
+            dataset_name, model_name, data_config, fold, batch_size,
+            minimax_config={
+                "prefix_length": params.get("minimax_prefix_length", 15),
+                "item_col": params.get("minimax_item_col", "concepts"),
+            },
+        )
+    elif model_name in ("akt_pgdro", "akt_beshift"):
+        train_loader, valid_loader = init_dataset4train(
+            dataset_name, model_name, data_config, fold, batch_size,
+            fairness_config={"seed": params["seed"], **beshift_config},
+        )
+    elif model_name not in ["dimkt"]:
         train_loader, valid_loader, *_ = init_dataset4train(dataset_name, model_name, data_config, fold, batch_size)
     else:
         diff_level = params["difficult_levels"]
         train_loader, valid_loader, *_ = init_dataset4train(dataset_name, model_name, data_config, fold, batch_size, diff_level=diff_level)
 
-    params_str = "_".join([str(v) for k,v in params.items() if not k in ['other_config']])
+    params_str = "_".join(
+        "-".join(map(str, v)) if k == "noisy_gamma" else str(v) for k, v in params.items()
+        if k != "other_config" and not (model_name in ("akt_minimax", "akt_interfairauc", "akt_noisyauc", "akt_minimaxfairauc") and k == "init_checkpoint")
+    )
+    if model_name in ("akt_minimax", "akt_interfairauc", "akt_noisyauc", "akt_minimaxfairauc") and params.get("init_checkpoint"):
+        source = os.path.abspath(params["init_checkpoint"]).encode("utf-8")
+        params_str += f"_warm_{hashlib.sha256(source).hexdigest()[:10]}"
 
     print(f"params: {params}, params_str: {params_str}")
     if params['add_uuid'] == 1 and params["use_wandb"] == 1:
@@ -126,7 +159,18 @@ def main(params):
     print(f"model_name:{model_name}")
     model = init_model(model_name, model_config, data_config[dataset_name], emb_type, dataset_name)
     print(f"model is {model}")
-    if model_name == "hawkes":
+    if model_name in ("akt_minimax", "akt_interfairauc", "akt_noisyauc", "akt_minimaxfairauc"):
+        if params.get("init_checkpoint"):
+            state = torch.load(params["init_checkpoint"], map_location=device)
+            state["log_pair_weights"] = model.log_pair_weights
+            if model_name == "akt_noisyauc":
+                state["noisy_radii"] = model.noisy_radii
+                state["noisy_dual"] = model.noisy_dual
+            model.load_state_dict(state)
+        opt = SGD(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+    elif model_name == "akt_pgdro":
+        opt = SGD(model.parameters(), lr=learning_rate)
+    elif model_name == "hawkes":
         weight_p, bias_p = [], []
         for name, p in filter(lambda x: x[1].requires_grad, model.named_parameters()):
             if 'bias' in name:
@@ -169,7 +213,7 @@ def main(params):
     
     if save_model:
         best_model = init_model(model_name, model_config, data_config[dataset_name], emb_type, dataset_name)
-        net = torch.load(os.path.join(ckpt_path, emb_type+"_model.ckpt"))
+        net = torch.load(os.path.join(ckpt_path, emb_type+"_model.ckpt"), map_location=device)
         best_model.load_state_dict(net)
 
     print("fold\tmodelname\tembtype\ttestauc\ttestacc\twindow_testauc\twindow_testacc\tvalidauc\tvalidacc\tbest_epoch")
@@ -178,5 +222,10 @@ def main(params):
     print(f"end:{datetime.datetime.now()}")
     
     if params['use_wandb']==1:
-        wandb.log({ 
-                    "validauc": validauc, "validacc": validacc, "best_epoch": best_epoch,"model_save_path":model_save_path})
+        metrics = {"validauc": validauc, "validacc": validacc, "best_epoch": best_epoch, "model_save_path": model_save_path}
+        if model_name == "akt_noisyauc":
+            metrics["valid_noisy_violation"], metrics["valid_noisy_ranking_loss"] = model.best_minimax_loss
+        elif model_name in ("akt_minimax", "akt_interfairauc", "akt_minimaxfairauc"):
+            metric = "valid_interfair_loss" if model_name == "akt_interfairauc" else "valid_minimax_loss"
+            metrics[metric] = model.best_minimax_loss
+        wandb.log(metrics)

@@ -23,5 +23,6 @@ setup(
     packages=find_packages(),
     python_requires=">=3.5",
     include_package_data=True,
+    extras_require={"auc": ["scipy", "matplotlib", "seaborn", "tqdm", "einops"]},
     install_requires=['numpy>=1.17.2','pandas>=1.1.5','scikit-learn','torch>=1.7.0','wandb>=0.12.9','entmax'],
 )

@@ -103,11 +103,27 @@ class KTDataset(Dataset):
                 dqtest[key] = self.dqtest[key][index]
             return dcur, dqtest
 
+    @classmethod
+    def from_sequences(cls, frame, input_type, qtest=False):
+        """Read an already selected sequence frame without a disk cache."""
+        dataset = cls.__new__(cls)
+        dataset.input_type = input_type
+        dataset.qtest = qtest
+        data = dataset._load_rows(frame)
+        if qtest:
+            dataset.dori, dataset.dqtest = data
+        else:
+            dataset.dori = data
+        return dataset
+
     def __load_data__(self, sequence_path, folds, pad_val=-1):
+        frame = pd.read_csv(sequence_path)
+        return self._load_rows(frame[frame["fold"].isin(folds)], pad_val=pad_val)
+
+    def _load_rows(self, df, pad_val=-1):
         """
         Args:
-            sequence_path (str): file path of the sequences
-            folds (list[int]): 
+            df (pd.DataFrame): sequence rows in evaluation order.
             pad_val (int, optional): pad value. Defaults to -1.
         Returns: 
             (tuple): tuple containing
@@ -121,8 +137,6 @@ class KTDataset(Dataset):
         dori = {"qseqs": [], "cseqs": [], "rseqs": [], "tseqs": [], "utseqs": [], "smasks": []}
 
         # seq_qids, seq_cids, seq_rights, seq_mask = [], [], [], []
-        df = pd.read_csv(sequence_path)#[0:1000]
-        df = df[df["fold"].isin(folds)]
         interaction_num = 0
         # seq_qidxs, seq_rests = [], []
         dqtest = {"qidxs": [], "rests":[], "orirow":[]}

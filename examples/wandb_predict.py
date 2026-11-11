@@ -11,12 +11,12 @@ from pykt.datasets import init_test_datasets
 device = "cpu" if not torch.cuda.is_available() else "cuda"
 os.environ['CUBLAS_WORKSPACE_CONFIG']=':4096:2'
 
-with open("../configs/wandb.json") as fin:
-    wandb_config = json.load(fin)
-
 def main(params):
-    if params['use_wandb'] ==1:
+    calibration_dir = params.get("calibration_dir")
+    if params['use_wandb'] == 1 and not calibration_dir:
         import wandb
+        with open("../configs/wandb.json") as fin:
+            wandb_config = json.load(fin)
         os.environ['WANDB_API_KEY'] = wandb_config["api_key"]
         wandb.init(project="wandb_predict")
 
@@ -25,7 +25,7 @@ def main(params):
     with open(os.path.join(save_dir, "config.json")) as fin:
         config = json.load(fin)
         model_config = copy.deepcopy(config["model_config"])
-        for remove_item in ['use_wandb','learning_rate','add_uuid','l2']:
+        for remove_item in ['use_wandb','learning_rate','add_uuid','l2','batch_size','num_epochs','weight_decay']:
             if remove_item in model_config:
                 del model_config[remove_item]    
         trained_params = config["params"]
@@ -54,7 +54,14 @@ def main(params):
     if model_name == "cdfkt":
         batch_size = 128
 
-    if model_name not in ["dimkt"]:        
+    if calibration_dir:
+        from DecomposeAUC.akt_calibration import export_validation
+
+        model = load_model(model_name, model_config, data_config, emb_type, save_dir)
+        export_validation(model, data_config, fold, calibration_dir, batch_size, fusion_type)
+        return
+
+    if model_name not in ["dimkt"]:
         test_loader, test_window_loader, test_question_loader, test_question_window_loader = init_test_datasets(data_config, model_name, batch_size)
     else:
         diff_level = trained_params["difficult_levels"]
@@ -84,7 +91,7 @@ def main(params):
     if model.model_name == "rkt":
         testauc, testacc = evaluate(model, test_loader, model_name, rel, save_test_path)
     else:
-        testauc, testacc = evaluate(model, test_loader, model_name, save_test_path)
+        testauc, testacc = evaluate(model, test_loader, model_name, save_path=save_test_path)
     print(f"testauc: {testauc}, testacc: {testacc}")
 
     window_testauc, window_testacc = -1, -1
@@ -92,7 +99,7 @@ def main(params):
     if model.model_name == "rkt":
         window_testauc, window_testacc = evaluate(model, test_window_loader, model_name, rel, save_test_window_path)
     else:
-        window_testauc, window_testacc = evaluate(model, test_window_loader, model_name, save_test_window_path)
+        window_testauc, window_testacc = evaluate(model, test_window_loader, model_name, save_path=save_test_window_path)
     print(f"testauc: {testauc}, testacc: {testacc}, window_testauc: {window_testauc}, window_testacc: {window_testacc}")
 
     # question_testauc, question_testacc = -1, -1
@@ -150,6 +157,7 @@ if __name__ == "__main__":
     parser.add_argument("--bz", type=int, default=256)
     parser.add_argument("--save_dir", type=str, default="saved_model")
     parser.add_argument("--fusion_type", type=str, default="early_fusion,late_fusion")
+    parser.add_argument("--calibration-dir", help="Export only the checkpoint's AKT validation fold to this new directory")
     parser.add_argument("--use_wandb", type=int, default=1)
 
     args = parser.parse_args()

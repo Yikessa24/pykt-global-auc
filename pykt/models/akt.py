@@ -8,6 +8,7 @@ from enum import IntEnum
 import numpy as np
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+CAUSAL_BLOCK_SIZE = 64
 
 class Dim(IntEnum):
     batch = 0
@@ -142,7 +143,7 @@ class Architecture(nn.Module):
                 for _ in range(n_blocks*2)
             ])
 
-    def forward(self, q_embed_data, qa_embed_data, pid_embed_data):
+    def forward(self, q_embed_data, qa_embed_data, pid_embed_data, *, reuse_attention_geometry=False):
         # target shape  bs, seqlen
         seqlen, batch_size = q_embed_data.size(1), q_embed_data.size(0)
 
@@ -152,18 +153,25 @@ class Architecture(nn.Module):
         y = qa_pos_embed
         seqlen, batch_size = y.size(1), y.size(0)
         x = q_pos_embed
+        geometry = None
+        if reuse_attention_geometry:
+            positions = torch.arange(seqlen, device=x.device)
+            offsets = (positions[:, None] - positions[None, :])[None, None, :, :]
+            causal_masks = (offsets > 0, offsets >= 0)
+            geometry = (causal_masks, offsets.abs().float())
 
         # encoder
         for block in self.blocks_1:  # encode qas, 对0～t-1时刻前的qa信息进行编码
-            y = block(mask=1, query=y, key=y, values=y, pdiff=pid_embed_data) # yt^
+            y = block(mask=1, query=y, key=y, values=y, pdiff=pid_embed_data, geometry=geometry)
         flag_first = True
         for block in self.blocks_2:
             if flag_first:  # peek current question
                 x = block(mask=1, query=x, key=x,
-                          values=x, apply_pos=False, pdiff=pid_embed_data) # False: 没有FFN, 第一层只有self attention, 对应于xt^
+                          values=x, apply_pos=False, pdiff=pid_embed_data, geometry=geometry)
                 flag_first = False
             else:  # dont peek current response
-                x = block(mask=0, query=x, key=x, values=y, apply_pos=True, pdiff=pid_embed_data) # True: +FFN+残差+laynorm 非第一层与0~t-1的的q的attention, 对应图中Knowledge Retriever
+                x = block(mask=0, query=x, key=x, values=y,
+                          apply_pos=True, pdiff=pid_embed_data, geometry=geometry)
                 # mask=0，不能看到当前的response, 在Knowledge Retrever的value全为0，因此，实现了第一题只有question信息，无qa信息的目的
                 # print(x[0,0,:])
                 flag_first = True
@@ -193,7 +201,7 @@ class TransformerLayer(nn.Module):
         self.layer_norm2 = nn.LayerNorm(d_model)
         self.dropout2 = nn.Dropout(dropout)
 
-    def forward(self, mask, query, key, values, apply_pos=True, pdiff=None):
+    def forward(self, mask, query, key, values, apply_pos=True, pdiff=None, geometry=None):
         """
         Input:
             block : object of type BasicBlock(nn.Module). It contains masked_attn_head objects which is of type MultiHeadAttention(nn.Module).
@@ -208,17 +216,18 @@ class TransformerLayer(nn.Module):
         """
 
         seqlen, batch_size = query.size(1), query.size(0)
-        nopeek_mask = np.triu(
-            np.ones((1, 1, seqlen, seqlen)), k=mask).astype('uint8')
-        src_mask = (torch.from_numpy(nopeek_mask) == 0).to(device)
-        if mask == 0:  # If 0, zero-padding is needed.
-            # Calls block.masked_attn_head.forward() method
-            query2 = self.masked_attn_head(
-                query, key, values, mask=src_mask, zero_pad=True, pdiff=pdiff) # 只能看到之前的信息，当前的信息也看不到，此时会把第一行score全置0，表示第一道题看不到历史的interaction信息，第一题attn之后，对应value全0
+        position_effect = None
+        if geometry is None:
+            nopeek_mask = np.triu(
+                np.ones((1, 1, seqlen, seqlen)), k=mask).astype('uint8')
+            src_mask = (torch.from_numpy(nopeek_mask) == 0).to(device)
         else:
-            # Calls block.masked_attn_head.forward() method
-            query2 = self.masked_attn_head(
-                query, key, values, mask=src_mask, zero_pad=False, pdiff=pdiff)
+            causal_masks, position_effect = geometry
+            src_mask = causal_masks[mask]
+        query2 = self.masked_attn_head(
+            query, key, values, mask=src_mask, zero_pad=mask == 0, pdiff=pdiff,
+            position_effect=position_effect,
+        )
 
         query = query + self.dropout1((query2)) # 残差1
         query = self.layer_norm1(query) # layer norm
@@ -279,7 +288,7 @@ class MultiHeadAttention(nn.Module):
             # constant_(self.attnlinear.bias, 0.)
             constant_(self.out_proj.bias, 0.)
 
-    def forward(self, q, k, v, mask, zero_pad, pdiff=None):
+    def forward(self, q, k, v, mask, zero_pad, pdiff=None, position_effect=None):
 
         bs = q.size(0)
 
@@ -296,9 +305,12 @@ class MultiHeadAttention(nn.Module):
         elif self.emb_type.startswith("qid"):
             # perform linear operation and split into h heads
 
+            shared_projection = position_effect is not None and q is k and self.kq_same
             k = self.k_linear(k).view(bs, -1, self.h, self.d_k)
             if self.kq_same is False:
                 q = self.q_linear(q).view(bs, -1, self.h, self.d_k)
+            elif shared_projection:
+                q = k
             else:
                 q = self.k_linear(q).view(bs, -1, self.h, self.d_k)
             v = self.v_linear(v).view(bs, -1, self.h, self.d_k)
@@ -312,8 +324,11 @@ class MultiHeadAttention(nn.Module):
             gammas = self.gammas
             if self.emb_type.find("pdiff") == -1:
                 pdiff = None
-            scores = attention(q, k, v, self.d_k,
-                            mask, self.dropout, zero_pad, gammas, pdiff)
+            attention_fn = attention
+            if position_effect is not None and q.device.type == "cpu" and q.size(-2) > CAUSAL_BLOCK_SIZE:
+                attention_fn = causal_attention_blocks
+            scores = attention_fn(q, k, v, self.d_k, mask, self.dropout, zero_pad,
+                                  gammas, pdiff, position_effect=position_effect)
 
             # concatenate heads and put through final linear layer
             concat = scores.transpose(1, 2).contiguous()\
@@ -331,7 +346,23 @@ class MultiHeadAttention(nn.Module):
         return scores
 
 
-def attention(q, k, v, d_k, mask, dropout, zero_pad, gamma=None, pdiff=None):
+def causal_attention_blocks(q, k, v, d_k, mask, dropout, zero_pad, gamma, pdiff, position_effect):
+    """Evaluate causal query blocks without materializing their future keys."""
+    length = q.size(-2)
+    outputs = []
+    for start in range(0, length, CAUSAL_BLOCK_SIZE):
+        stop = min(start + CAUSAL_BLOCK_SIZE, length)
+        block = slice(start, stop)
+        outputs.append(attention(
+            q[..., block, :], k[..., :stop, :], v[..., :stop, :], d_k,
+            mask[..., block, :stop], dropout, zero_pad and start == 0, gamma,
+            pdiff[:, block, :] if pdiff is not None else None,
+            position_effect=position_effect[..., block, :stop],
+        ))
+    return torch.cat(outputs, dim=-2)
+
+
+def attention(q, k, v, d_k, mask, dropout, zero_pad, gamma=None, pdiff=None, position_effect=None):
     """
     This is called by Multi-head atention object to find the values.
     """
@@ -340,10 +371,12 @@ def attention(q, k, v, d_k, mask, dropout, zero_pad, gamma=None, pdiff=None):
         math.sqrt(d_k)  # BS, 8, seqlen, seqlen
     bs, head, seqlen = scores.size(0), scores.size(1), scores.size(2)
 
-    x1 = torch.arange(seqlen).expand(seqlen, -1).to(device)
-    x2 = x1.transpose(0, 1).contiguous()
-
     with torch.no_grad():
+        reuse_geometry = position_effect is not None
+        if position_effect is None:
+            x1 = torch.arange(seqlen).expand(seqlen, -1).to(device)
+            x2 = x1.transpose(0, 1).contiguous()
+            position_effect = torch.abs(x1 - x2)[None, None, :, :].type(torch.FloatTensor).to(device)
         scores_ = scores.masked_fill(mask == 0, -1e32)
         scores_ = F.softmax(scores_, dim=-1)  # BS,8,seqlen,seqlen
         scores_ = scores_ * mask.float().to(device) # 结果和上一步一样
@@ -351,12 +384,14 @@ def attention(q, k, v, d_k, mask, dropout, zero_pad, gamma=None, pdiff=None):
         disttotal_scores = torch.sum(
             scores_, dim=-1, keepdim=True)  # bs, 8, sl, 1 全1
         # print(f"distotal_scores: {disttotal_scores}")
-        position_effect = torch.abs(
-            x1-x2)[None, None, :, :].type(torch.FloatTensor).to(device)  # 1, 1, seqlen, seqlen 位置差值
-        # bs, 8, sl, sl positive distance
-        dist_scores = torch.clamp(
-            (disttotal_scores-distcum_scores)*position_effect, min=0.) # score <0 时，设置为0
-        dist_scores = dist_scores.sqrt().detach()
+        if reuse_geometry:
+            # AKT detaches the distance calculation, so reuse the cumulative
+            # probability buffer for its elementwise operations.
+            torch.sub(disttotal_scores, distcum_scores, out=distcum_scores)
+            dist_scores = distcum_scores.mul_(position_effect).clamp_min_(0.0).sqrt_()
+        else:
+            dist_scores = torch.clamp((disttotal_scores - distcum_scores) * position_effect, min=0.)
+            dist_scores = dist_scores.sqrt().detach()
     m = nn.Softplus()
     gamma = -1. * m(gamma).unsqueeze(0)  # 1,8,1,1 一个头一个gamma参数， 对应论文里的theta
     # Now after do exp(gamma*distance) and then clamp to 1e-5 to 1e5
@@ -375,7 +410,7 @@ def attention(q, k, v, d_k, mask, dropout, zero_pad, gamma=None, pdiff=None):
     # print(f"before zero pad scores: {scores.shape}")
     # print(zero_pad)
     if zero_pad:
-        pad_zero = torch.zeros(bs, head, 1, seqlen).to(device)
+        pad_zero = torch.zeros(bs, head, 1, scores.size(-1)).to(device)
         scores = torch.cat([pad_zero, scores[:, :, 1:, :]], dim=2) # 第一行score置0
     # print(f"after zero pad scores: {scores}")
     scores = dropout(scores)

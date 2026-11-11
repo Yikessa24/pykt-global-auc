@@ -1,10 +1,12 @@
 import os, sys
 import torch
 import torch.nn as nn
-from torch.nn.functional import one_hot, binary_cross_entropy, cross_entropy
+from torch.nn.functional import one_hot, binary_cross_entropy, binary_cross_entropy_with_logits, cross_entropy
 from torch.nn.utils.clip_grad import clip_grad_norm_
 import numpy as np
 from .evaluate_model import evaluate
+from .akt_minimax import group_pair_risks, sampled_group_pair_risks
+from sklearn.metrics import roc_auc_score
 from torch.autograd import Variable, grad
 from .atkt import _l2_normalize_adv
 from ..utils.utils import debug_print
@@ -71,7 +73,7 @@ def cal_loss(model, ys, r, rshft, sm, preloss=[]):
         loss_w2 = loss_w2.mean() / model.num_c
 
         loss = loss + model.lambda_r * loss_r + model.lambda_w1 * loss_w1 + model.lambda_w2 * loss_w2
-    elif model_name in ["mockt", "akt","extrakt","folibikt", "robustkt", "akt_vector", "akt_norasch", "akt_mono", "akt_attn", "aktattn_pos", "aktmono_pos", "akt_raschx", "akt_raschy", "aktvec_raschx","lefokt_akt", "dtransformer", "fluckt", "akt_enhance_pro_qid"]:
+    elif model_name in ["mockt", "akt", "akt_beshift","extrakt","folibikt", "robustkt", "akt_vector", "akt_norasch", "akt_mono", "akt_attn", "aktattn_pos", "aktmono_pos", "akt_raschx", "akt_raschy", "aktvec_raschx","lefokt_akt", "dtransformer", "fluckt", "akt_enhance_pro_qid"]:
         y = torch.masked_select(ys[0], sm)
         t = torch.masked_select(rshft, sm)
         loss = binary_cross_entropy(y.double(), t.double()) + preloss[0]
@@ -86,6 +88,25 @@ def cal_loss(model, ys, r, rshft, sm, preloss=[]):
 
 def model_forward(model, data, rel=None):
     model_name = model.model_name
+    if model_name == "akt_interfairauc":
+        scores, reg = model.sequence_scores(data)
+        mask = data["smasks"].to(scores.device)
+        labels = data["shft_rseqs"].to(scores.device)
+        return model.ranking_loss(scores[mask], labels[mask], *model.grouped_scores(scores, data)) + reg
+    if model_name == "akt_minimaxfairauc":
+        scores, _ = model.sequence_scores(data)
+        risks = group_pair_risks(*model.grouped_scores(scores, data), training=True, exact=True)
+        return model.minimax_loss(risks), risks.detach()
+    if model_name == "akt_minimax":
+        scores, reg = model.sequence_scores(data)
+        mask = data["smasks"].to(scores.device)
+        labels = data["shft_rseqs"].to(device=scores.device, dtype=scores.dtype)
+        bce = binary_cross_entropy_with_logits(scores.masked_fill(~mask, 0.0), labels, reduction="none")
+        bce = bce.masked_fill(~mask, 0.0).sum() / mask.sum().clamp_min(1)
+        risks = sampled_group_pair_risks(
+            scores, labels, data["minimax_group"].to(scores.device), data["minimax_mask"].to(scores.device),
+        )
+        return bce + model.minimax_weight * model.minimax_loss(risks) + reg, risks.detach()
     # if model_name in ["dkt_forget", "lpkt"]:
     #     q, c, r, qshft, cshft, rshft, m, sm, d, dshft = data
     if model_name in ["dkt_forget", "bakt_time", "fa_kt", "mtkt"]:
@@ -107,6 +128,13 @@ def model_forward(model, data, rel=None):
     cq = torch.cat((q[:,0:1], qshft), dim=1)
     cc = torch.cat((c[:,0:1], cshft), dim=1)
     cr = torch.cat((r[:,0:1], rshft), dim=1)
+    if model_name == "akt_pgdro":
+        predictions, _ = model(cc.long(), cr.long(), cq.long())
+        return model.pgdro_loss(predictions[:, 1:], rshft, cshft, m & sm, int(dcur["pgdro_group"][0]))
+    if model_name == "akt_dro":
+        valid = torch.cat((torch.zeros_like(sm[:, :1]), m & sm), dim=1)
+        preds, reg = model(cc.long(), cr.long(), cq.long(), valid_mask=valid)
+        return binary_cross_entropy(preds[valid], cr[valid].float()) + reg
     if model_name in ["hawkes"]:
         ct = torch.cat((t[:,0:1], tshft), dim=1)
     elif model_name in ["rkt"]:
@@ -240,7 +268,7 @@ def model_forward(model, data, rel=None):
     elif model_name in ["saint"]:
         y = model(cq.long(), cc.long(), r.long())
         ys.append(y[:, 1:])
-    elif model_name in ["akt","extrakt","folibikt", "robustkt", "akt_vector", "akt_norasch", "akt_mono", "akt_attn", "aktattn_pos", "aktmono_pos", "akt_raschx", "akt_raschy", "aktvec_raschx", "lefokt_akt", "fluckt"]:
+    elif model_name in ["akt", "akt_beshift","extrakt","folibikt", "robustkt", "akt_vector", "akt_norasch", "akt_mono", "akt_attn", "aktattn_pos", "aktmono_pos", "akt_raschx", "akt_raschy", "aktvec_raschx", "lefokt_akt", "fluckt"]:
         y, reg_loss = model(cc.long(), cr.long(), cq.long())
         ys.append(y[:,1:])
         preloss.append(reg_loss)
@@ -294,9 +322,50 @@ def model_forward(model, data, rel=None):
     return loss
     
 
+@torch.no_grad()
+def _evaluate_minimax(model, loader):
+    model.eval()
+    interfair = model.model_name == "akt_interfairauc"
+    grouped, overall = [], []
+    for batch in loader:
+        sequence_scores, _ = model.sequence_scores(batch)
+        grouped.append(model.grouped_scores(sequence_scores, batch))
+        if interfair:
+            mask = batch["smasks"].to(sequence_scores.device)
+            labels = batch["shft_rseqs"].to(sequence_scores.device)
+            overall.append((sequence_scores[mask], labels[mask]))
+    scores, labels, groups = (torch.cat(parts) for parts in zip(*grouped))
+    overall_scores, overall_labels = (
+        (torch.cat(parts) for parts in zip(*overall)) if interfair else (scores, labels)
+    )
+    probabilities = overall_scores.sigmoid()
+    auc = roc_auc_score(overall_labels.cpu().numpy(), probabilities.cpu().numpy())
+    if interfair:
+        worst_risk = model.validation_loss(scores.sigmoid(), labels, groups, auc)
+    elif model.model_name == "akt_noisyauc":
+        worst_risk = model.validation_loss(scores, labels, groups)
+    else:
+        worst_risk = group_pair_risks(
+            scores, labels, groups, training=False, exact=model.model_name == "akt_minimaxfairauc",
+        ).max().item()
+    acc = ((probabilities >= 0.5) == (overall_labels == 1)).float().mean().item()
+    return auc, acc, worst_risk
+
+
 def train_model(model, train_loader, valid_loader, num_epochs, opt, ckpt_path, test_loader=None, test_window_loader=None, save_model=False, data_config=None, fold=None):
     max_auc, best_epoch = 0, -1
     train_step = 0
+    minimax = model.model_name in ("akt_minimax", "akt_minimaxfairauc")
+    fast_minimax = model.model_name == "akt_minimax"
+    noisy_auc = model.model_name == "akt_noisyauc"
+    grouped_ranking = minimax or noisy_auc or model.model_name == "akt_interfairauc"
+    if minimax:
+        model.initialize_pair_weights(train_loader.group_label_counts)
+    if model.model_name == "akt_pgdro":
+        model.pgdro_kc_weights.copy_(torch.as_tensor(train_loader.pgdro_kc_weights))
+    if grouped_ranking:
+        model.best_minimax_loss = (float("inf"), float("inf")) if noisy_auc else float("inf")
+
 
     rel = None
     if model.model_name == "rkt":
@@ -321,7 +390,13 @@ def train_model(model, train_loader, valid_loader, num_epochs, opt, ckpt_path, t
                 model.model.train()
             else:
                 model.train()
-            if model.model_name=='rkt':
+            if noisy_auc:
+                loss = model.train_noisy_batch(data, opt)
+                loss_mean.append(loss.cpu().numpy())
+                continue
+            if minimax:
+                loss, pair_risks = model_forward(model, data)
+            elif model.model_name=='rkt':
                 loss = model_forward(model, data, rel)
             elif model.model_name in ["ukt"] and model.use_CL != 0:
                 loss,temp = model_forward(model, data)
@@ -338,23 +413,35 @@ def train_model(model, train_loader, valid_loader, num_epochs, opt, ckpt_path, t
             if model.model_name == "cdfkt":
                 clip_grad_norm_(model.parameters(), 10)
             opt.step()#update model’s parameters
+            if minimax:
+                model.update_pair_weights(pair_risks, opt.param_groups[0]["lr"])
                 
-            loss_mean.append(loss.detach().cpu().numpy())
+            loss_mean.append(loss.detach() if fast_minimax else loss.detach().cpu().numpy())
             if model.model_name == "gkt" and train_step%10==0:
                 text = f"Total train step is {train_step}, the loss is {loss.item():.5}"
                 debug_print(text = text,fuc_name="train_model")
         if model.model_name=='lpkt':
             scheduler.step()#update each epoch
-        loss_mean = np.mean(loss_mean)
+        loss_mean = torch.stack(loss_mean).mean().item() if fast_minimax else np.mean(loss_mean)
         
-        if model.model_name=='rkt':
+        if grouped_ranking:
+            auc, acc, worst_risk = _evaluate_minimax(model, valid_loader)
+            improved = worst_risk < model.best_minimax_loss
+            if improved:
+                model.best_minimax_loss = worst_risk
+            print(f"{model.model_name} validation: ranking objective={worst_risk}, global AUC={auc:.6f}")
+        elif model.model_name=='rkt':
             auc, acc = evaluate(model, valid_loader, model.model_name, rel)
         else:
             auc, acc = evaluate(model, valid_loader, model.model_name)
         ### atkt 有diff， 以下代码导致的
         ### auc, acc = round(auc, 4), round(acc, 4)
 
-        if auc > max_auc+1e-3:
+        if not grouped_ranking:
+            improved = auc > max_auc + 1e-3
+            if best_epoch == -1 and model.model_name in ("akt_pgdro", "akt_beshift"):
+                improved = True
+        if improved:
             if save_model:
                 torch.save(model.state_dict(), os.path.join(ckpt_path, model.emb_type+"_model.ckpt"))
             max_auc = auc
@@ -364,12 +451,13 @@ def train_model(model, train_loader, valid_loader, num_epochs, opt, ckpt_path, t
             if not save_model:
                 if test_loader != None:
                     save_test_path = os.path.join(ckpt_path, model.emb_type+"_test_predictions.txt")
-                    testauc, testacc = evaluate(model, test_loader, model.model_name, save_test_path)
+                    testauc, testacc = evaluate(model, test_loader, model.model_name, save_path=save_test_path)
                 if test_window_loader != None:
                     save_test_path = os.path.join(ckpt_path, model.emb_type+"_test_window_predictions.txt")
-                    window_testauc, window_testacc = evaluate(model, test_window_loader, model.model_name, save_test_path)
+                    window_testauc, window_testacc = evaluate(model, test_window_loader, model.model_name, save_path=save_test_path)
             validauc, validacc = auc, acc
-        print(f"Epoch: {i}, validauc: {validauc:.4}, validacc: {validacc:.4}, best epoch: {best_epoch}, best auc: {max_auc:.4}, train loss: {loss_mean}, emb_type: {model.emb_type}, model: {model.model_name}, save_dir: {ckpt_path}")
+        auc_label = "checkpoint auc" if grouped_ranking else "best auc"
+        print(f"Epoch: {i}, validauc: {validauc:.4}, validacc: {validacc:.4}, best epoch: {best_epoch}, {auc_label}: {max_auc:.4}, train loss: {loss_mean}, emb_type: {model.emb_type}, model: {model.model_name}, save_dir: {ckpt_path}")
         print(f"            testauc: {round(testauc,4)}, testacc: {round(testacc,4)}, window_testauc: {round(window_testauc,4)}, window_testacc: {round(window_testacc,4)}")
 
 

@@ -1,0 +1,32 @@
+program: wandb_akt_minimax_train.py
+method: grid
+metric:
+  goal: minimize
+  name: valid_minimax_loss
+parameters:
+  model_name:
+    value: akt_minimax
+  dataset_name:
+    value: assist2015
+  emb_type:
+    value: qid
+  save_dir:
+    value: models/akt_minimax
+  d_model:
+    value: 256
+  d_ff:
+    value: 512
+  dropout:
+    value: 0.2
+  num_attn_heads:
+    value: 8
+  n_blocks:
+    value: 4
+  learning_rate:
+    values: [0.001, 0.003, 0.01]
+  minimax_temperature:
+    values: [3.0, 7.0, 10.0]
+  seed:
+    values: [42, 3407]
+  fold:
+    value: 0

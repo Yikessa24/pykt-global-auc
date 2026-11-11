@@ -378,18 +378,18 @@ def expand_question(dcur, global_qidx, pad_val=-1):
     return dextend, global_qidx
 
 
-def generate_question_sequences(df, effective_keys, window=True, min_seq_len=3, maxlen=200, pad_val=-1):
+def generate_question_sequences(df, effective_keys, window=True, min_seq_len=3, maxlen=200, pad_val=-1,
+                                *, start_row=0, start_question=0):
     if "questions" not in effective_keys or "concepts" not in effective_keys:
         print(f"has no questions or concepts, has no question sequences!")
         return False, None
     save_keys = list(effective_keys) + \
         ["selectmasks", "qidxs", "rest", "orirow"]
     dres = {}  # "selectmasks": []}
-    global_qidx = -1
-    df["index"] = list(range(0, df.shape[0]))
-    for i, row in df.iterrows():
+    global_qidx = start_question - 1
+    for orirow, (_, row) in enumerate(df.iterrows(), start=start_row):
         dcur = save_dcur(row, effective_keys)
-        dcur["orirow"] = [row["index"]] * len(dcur["responses"])
+        dcur["orirow"] = [orirow] * len(dcur["responses"])
 
         dexpand, global_qidx = expand_question(dcur, global_qidx)
         seq_num = len(dexpand["responses"])
@@ -466,7 +466,7 @@ def generate_question_sequences(df, effective_keys, window=True, min_seq_len=3, 
     for key in ALL_KEYS:
         if key in save_keys:
             # print(f"key: {key}, len: {len(dres[key])}")
-            dfinal[key] = dres[key]
+            dfinal[key] = dres.get(key, [])
     finaldf = pd.DataFrame(dfinal)
     return True, finaldf
 
